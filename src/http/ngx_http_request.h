@@ -433,6 +433,9 @@ struct ngx_http_request_s {
 
     ngx_http_variable_value_t        *variables;
 
+    ngx_str_t                         open_file_name;
+    ngx_open_file_info_t              open_file_info;
+
 #if (NGX_PCRE)
     ngx_uint_t                        ncaptures;
     int                              *captures;

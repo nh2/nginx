@@ -22,6 +22,8 @@
 
 
 static void ngx_open_file_cache_cleanup(void *data);
+static ngx_int_t ngx_open_uncached_file(ngx_str_t *name,
+    ngx_open_file_info_t *of, ngx_pool_t *pool);
 #if (NGX_HAVE_OPENAT)
 static ngx_fd_t ngx_openat_file_owner(ngx_fd_t at_fd, const u_char *name,
     ngx_int_t mode, ngx_int_t create, ngx_int_t access, ngx_log_t *log);
@@ -147,54 +149,15 @@ ngx_open_cached_file(ngx_open_file_cache_t *cache, ngx_str_t *name,
     time_t                          now;
     uint32_t                        hash;
     ngx_int_t                       rc;
-    ngx_file_info_t                 fi;
     ngx_pool_cleanup_t             *cln;
     ngx_cached_open_file_t         *file;
-    ngx_pool_cleanup_file_t        *clnf;
     ngx_open_file_cache_cleanup_t  *ofcln;
 
     of->fd = NGX_INVALID_FILE;
     of->err = 0;
 
     if (cache == NULL) {
-
-        if (of->test_only) {
-
-            if (ngx_file_info_wrapper(name, of, &fi, pool->log)
-                == NGX_FILE_ERROR)
-            {
-                return NGX_ERROR;
-            }
-
-            of->uniq = ngx_file_uniq(&fi);
-            of->mtime = ngx_file_mtime(&fi);
-            of->size = ngx_file_size(&fi);
-            of->fs_size = ngx_file_fs_size(&fi);
-            of->is_dir = ngx_is_dir(&fi);
-            of->is_file = ngx_is_file(&fi);
-            of->is_link = ngx_is_link(&fi);
-            of->is_exec = ngx_is_exec(&fi);
-
-            return NGX_OK;
-        }
-
-        cln = ngx_pool_cleanup_add(pool, sizeof(ngx_pool_cleanup_file_t));
-        if (cln == NULL) {
-            return NGX_ERROR;
-        }
-
-        rc = ngx_open_and_stat_file(name, of, pool->log);
-
-        if (rc == NGX_OK && !of->is_dir) {
-            cln->handler = ngx_pool_cleanup_file;
-            clnf = cln->data;
-
-            clnf->fd = of->fd;
-            clnf->name = name->data;
-            clnf->log = pool->log;
-        }
-
-        return rc;
+        return ngx_open_uncached_file(name, of, pool);
     }
 
     cln = ngx_pool_cleanup_add(pool, sizeof(ngx_open_file_cache_cleanup_t));
@@ -483,6 +446,163 @@ failed:
     }
 
     return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_open_uncached_file(ngx_str_t *name, ngx_open_file_info_t *of,
+    ngx_pool_t *pool)
+{
+    ngx_fd_t                  fd;
+    ngx_int_t                 mode, create, access;
+    ngx_file_info_t           fi;
+    ngx_pool_cleanup_t       *cln;
+    ngx_pool_cleanup_file_t  *clnf;
+
+    if (of->test_only || of->test_dir) {
+
+        if (ngx_file_info_wrapper(name, of, &fi, pool->log) == NGX_FILE_ERROR) {
+            return NGX_ERROR;
+        }
+
+        if (of->test_only || ngx_is_dir(&fi)) {
+            goto done;
+        }
+    }
+
+    if (!of->log) {
+
+        /*
+         * Use non-blocking open() not to hang on FIFO files, etc.
+         * This flag has no effect on a regular files.
+         */
+
+        mode = NGX_FILE_RDONLY|NGX_FILE_NONBLOCK;
+        create = NGX_FILE_OPEN;
+        access = 0;
+
+    } else {
+        mode = NGX_FILE_APPEND;
+        create = NGX_FILE_CREATE_OR_OPEN;
+        access = NGX_FILE_DEFAULT_ACCESS;
+    }
+
+#if (NGX_THREADS)
+
+    if (of->thread_handler
+        && of->disable_symlinks == NGX_DISABLE_SYMLINKS_OFF)
+    {
+        ngx_int_t   rc;
+        ngx_file_t  file;
+
+        ngx_memzero(&file, sizeof(ngx_file_t));
+
+        file.log = pool->log;
+        file.fd = NGX_INVALID_FILE;
+        file.thread_handler = of->thread_handler;
+        file.thread_ctx = of->thread_ctx;
+        file.thread_task = of->thread_task;
+
+        rc = ngx_thread_open(&file, name->data, mode, create, access, pool);
+
+        if (rc == NGX_AGAIN) {
+            of->thread_task = file.thread_task;
+            return NGX_AGAIN;
+        }
+
+        if (rc != NGX_OK) {
+            of->err = file.err;
+            of->failed = ngx_open_file_n;
+            return NGX_ERROR;
+        }
+
+        fd = file.fd;
+
+    } else {
+        fd = ngx_open_file_wrapper(name, of, mode, create, access, pool->log);
+        if (fd == NGX_INVALID_FILE) {
+            return NGX_ERROR;
+        }
+    }
+
+#else
+    fd = ngx_open_file_wrapper(name, of, mode, create, access, pool->log);
+    if (fd == NGX_INVALID_FILE) {
+        return NGX_ERROR;
+    }
+#endif
+
+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_CRIT, pool->log, ngx_errno,
+                      ngx_fd_info_n " \"%V\" failed", name);
+
+        if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, pool->log, ngx_errno,
+                          ngx_close_file_n " \"%V\" failed", name);
+        }
+
+        return NGX_ERROR;
+    }
+
+    if (ngx_is_dir(&fi)) {
+        if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, pool->log, ngx_errno,
+                          ngx_close_file_n " \"%V\" failed", name);
+        }
+
+    } else {
+        of->fd = fd;
+
+        if (of->read_ahead && ngx_file_size(&fi) > NGX_MIN_READ_AHEAD) {
+            if (ngx_read_ahead(fd, of->read_ahead) == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ALERT, pool->log, ngx_errno,
+                              ngx_read_ahead_n " \"%V\" failed", name);
+            }
+        }
+
+        if (of->directio <= ngx_file_size(&fi)) {
+            if (ngx_directio_on(fd) == NGX_FILE_ERROR) {
+                ngx_log_error(NGX_LOG_ALERT, pool->log, ngx_errno,
+                              ngx_directio_on_n " \"%V\" failed", name);
+
+            } else {
+                of->is_directio = 1;
+            }
+        }
+    }
+
+done:
+
+    of->uniq = ngx_file_uniq(&fi);
+    of->mtime = ngx_file_mtime(&fi);
+    of->size = ngx_file_size(&fi);
+    of->fs_size = ngx_file_fs_size(&fi);
+    of->is_dir = ngx_is_dir(&fi);
+    of->is_file = ngx_is_file(&fi);
+    of->is_link = ngx_is_link(&fi);
+    of->is_exec = ngx_is_exec(&fi);
+
+    if (of->fd != NGX_INVALID_FILE) {
+        cln = ngx_pool_cleanup_add(pool, sizeof(ngx_pool_cleanup_file_t));
+
+        if (cln == NULL) {
+            if (ngx_close_file(of->fd) == NGX_FILE_ERROR) {
+                ngx_log_error(NGX_LOG_ALERT, pool->log, ngx_errno,
+                              ngx_close_file_n " \"%s\" failed", name->data);
+            }
+
+            return NGX_ERROR;
+        }
+
+        cln->handler = ngx_pool_cleanup_file;
+        clnf = cln->data;
+
+        clnf->fd = of->fd;
+        clnf->name = name->data;
+        clnf->log = pool->log;
+    }
+
+    return NGX_OK;
 }
 
 

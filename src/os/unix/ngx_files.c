@@ -11,6 +11,7 @@
 
 #if (NGX_THREADS)
 #include <ngx_thread_pool.h>
+static void ngx_thread_open_handler(void *data, ngx_log_t *log);
 static void ngx_thread_read_handler(void *data, ngx_log_t *log);
 static void ngx_thread_write_chain_to_file_handler(void *data, ngx_log_t *log);
 #endif
@@ -77,18 +78,110 @@ ngx_read_file(ngx_file_t *file, u_char *buf, size_t size, off_t offset)
 
 #if (NGX_THREADS)
 
+typedef enum {
+    NGX_THREAD_FILE_OPEN = 1,
+    NGX_THREAD_FILE_READ,
+    NGX_THREAD_FILE_WRITE
+} ngx_thread_file_op_e;
+
+
 typedef struct {
     ngx_fd_t       fd;
-    ngx_uint_t     write;   /* unsigned  write:1; */
+    u_char        *name;
+    ngx_uint_t     op;  /* ngx_thread_file_op_e */
 
     u_char        *buf;
     size_t         size;
     ngx_chain_t   *chain;
     off_t          offset;
 
+    ngx_int_t      mode;
+    ngx_int_t      create;
+    ngx_int_t      access;
+
     size_t         nbytes;
     ngx_err_t      err;
 } ngx_thread_file_ctx_t;
+
+
+ngx_int_t
+ngx_thread_open(ngx_file_t *file, u_char *name, ngx_int_t mode,
+    ngx_int_t create, ngx_int_t access, ngx_pool_t *pool)
+{
+    ngx_thread_task_t      *task;
+    ngx_thread_file_ctx_t  *ctx;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, file->log, 0,
+                   "thread open: \"%s\"", name);
+
+    task = file->thread_task;
+
+    if (task == NULL) {
+        task = ngx_thread_task_alloc(pool, sizeof(ngx_thread_file_ctx_t));
+        if (task == NULL) {
+            return NGX_ERROR;
+        }
+
+        file->thread_task = task;
+    }
+
+    ctx = task->ctx;
+
+    if (task->event.complete) {
+        task->event.complete = 0;
+
+        if (ctx->op != NGX_THREAD_FILE_OPEN) {
+            ngx_log_error(NGX_LOG_ALERT, file->log, 0,
+                          "invalid thread operation, open expected");
+            return NGX_ERROR;
+        }
+
+        if (ctx->err) {
+            file->err = ctx->err;
+            return NGX_ERROR;
+        }
+
+        file->fd = ctx->fd;
+
+        return NGX_OK;
+    }
+
+    task->handler = ngx_thread_open_handler;
+
+    ctx->op = NGX_THREAD_FILE_OPEN;
+
+    ctx->name = name;
+    ctx->mode = mode;
+    ctx->create = create;
+    ctx->access = access;
+
+    if (file->thread_handler(task, file) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+static void
+ngx_thread_open_handler(void *data, ngx_log_t *log)
+{
+    ngx_thread_file_ctx_t *ctx = data;
+
+    ngx_fd_t  fd;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, log, 0, "thread open handler");
+
+    fd = ngx_open_file(ctx->name, ctx->mode, ctx->create, ctx->access);
+
+    if (fd == NGX_INVALID_FILE) {
+        ctx->err = ngx_errno;
+
+    } else {
+        ctx->fd = fd;
+        ctx->err = 0;
+    }
+}
 
 
 ssize_t
@@ -118,9 +211,9 @@ ngx_thread_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
     if (task->event.complete) {
         task->event.complete = 0;
 
-        if (ctx->write) {
+        if (ctx->op != NGX_THREAD_FILE_READ) {
             ngx_log_error(NGX_LOG_ALERT, file->log, 0,
-                          "invalid thread call, read instead of write");
+                          "invalid thread operation, read expected");
             return NGX_ERROR;
         }
 
@@ -135,7 +228,7 @@ ngx_thread_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
 
     task->handler = ngx_thread_read_handler;
 
-    ctx->write = 0;
+    ctx->op = NGX_THREAD_FILE_READ;
 
     ctx->fd = file->fd;
     ctx->buf = buf;
@@ -501,9 +594,9 @@ ngx_thread_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl, off_t offset,
     if (task->event.complete) {
         task->event.complete = 0;
 
-        if (!ctx->write) {
+        if (ctx->op != NGX_THREAD_FILE_WRITE) {
             ngx_log_error(NGX_LOG_ALERT, file->log, 0,
-                          "invalid thread call, write instead of read");
+                          "invalid thread operation, write expected");
             return NGX_ERROR;
         }
 
@@ -519,7 +612,7 @@ ngx_thread_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl, off_t offset,
 
     task->handler = ngx_thread_write_chain_to_file_handler;
 
-    ctx->write = 1;
+    ctx->op = NGX_THREAD_FILE_WRITE;
 
     ctx->fd = file->fd;
     ctx->chain = cl;

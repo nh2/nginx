@@ -18,6 +18,8 @@ static void ngx_http_file_cache_lock_wait(ngx_http_request_t *r,
     ngx_http_cache_t *c);
 static ngx_int_t ngx_http_file_cache_read(ngx_http_request_t *r,
     ngx_http_cache_t *c);
+static ngx_int_t ngx_http_file_cache_aio_open(ngx_http_request_t *r,
+    ngx_http_cache_t *c);
 static ssize_t ngx_http_file_cache_aio_read(ngx_http_request_t *r,
     ngx_http_cache_t *c);
 #if (NGX_HAVE_FILE_AIO)
@@ -264,13 +266,11 @@ ngx_http_file_cache_create_key(ngx_http_request_t *r)
 ngx_int_t
 ngx_http_file_cache_open(ngx_http_request_t *r)
 {
-    ngx_int_t                  rc, rv;
-    ngx_uint_t                 test;
-    ngx_http_cache_t          *c;
-    ngx_pool_cleanup_t        *cln;
-    ngx_open_file_info_t       of;
-    ngx_http_file_cache_t     *cache;
-    ngx_http_core_loc_conf_t  *clcf;
+    ngx_int_t               rc;
+    ngx_uint_t              test;
+    ngx_http_cache_t       *c;
+    ngx_pool_cleanup_t     *cln;
+    ngx_http_file_cache_t  *cache;
 
     c = r->cache;
 
@@ -317,7 +317,6 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
 
         c->temp_file = 1;
         test = c->exists ? 1 : 0;
-        rv = NGX_DECLINED;
 
     } else { /* rc == NGX_DECLINED */
 
@@ -329,11 +328,10 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
                 return NGX_HTTP_CACHE_SCARCE;
             }
 
-            rv = NGX_HTTP_CACHE_SCARCE;
+            c->temp_file = 0;
 
         } else {
             c->temp_file = 1;
-            rv = NGX_DECLINED;
         }
     }
 
@@ -342,62 +340,10 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
     }
 
     if (!test) {
-        goto done;
-    }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-
-    ngx_memzero(&of, sizeof(ngx_open_file_info_t));
-
-    of.uniq = c->uniq;
-    of.valid = clcf->open_file_cache_valid;
-    of.min_uses = clcf->open_file_cache_min_uses;
-    of.events = clcf->open_file_cache_events;
-    of.directio = NGX_OPEN_FILE_DIRECTIO_OFF;
-    of.read_ahead = clcf->read_ahead;
-
-    if (ngx_open_cached_file(clcf->open_file_cache, &c->file.name, &of, r->pool)
-        != NGX_OK)
-    {
-        switch (of.err) {
-
-        case 0:
-            return NGX_ERROR;
-
-        case NGX_ENOENT:
-        case NGX_ENOTDIR:
-            goto done;
-
-        default:
-            ngx_log_error(NGX_LOG_CRIT, r->connection->log, of.err,
-                          ngx_open_file_n " \"%s\" failed", c->file.name.data);
-            return NGX_ERROR;
-        }
-    }
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http file cache fd: %d", of.fd);
-
-    c->file.fd = of.fd;
-    c->file.log = r->connection->log;
-    c->uniq = of.uniq;
-    c->length = of.size;
-    c->fs_size = (of.fs_size + cache->bsize - 1) / cache->bsize;
-
-    c->buf = ngx_create_temp_buf(r->pool, c->body_start);
-    if (c->buf == NULL) {
-        return NGX_ERROR;
-    }
-
-    return ngx_http_file_cache_read(r, c);
-
-done:
-
-    if (rv == NGX_DECLINED) {
         return ngx_http_file_cache_lock(r, c);
     }
 
-    return rv;
+    return ngx_http_file_cache_read(r, c);
 }
 
 
@@ -406,6 +352,10 @@ ngx_http_file_cache_lock(ngx_http_request_t *r, ngx_http_cache_t *c)
 {
     ngx_msec_t                 now, timer;
     ngx_http_file_cache_t     *cache;
+
+    if (!c->temp_file) {
+        return NGX_HTTP_CACHE_SCARCE;
+    }
 
     if (!c->lock) {
         return NGX_DECLINED;
@@ -536,6 +486,12 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
     ngx_http_file_cache_t         *cache;
     ngx_http_file_cache_header_t  *h;
 
+    rc = ngx_http_file_cache_aio_open(r, c);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
     n = ngx_http_file_cache_aio_read(r, c);
 
     if (n < 0) {
@@ -659,6 +615,89 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
                        rc, c->valid_sec, now);
 
         return rc;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_file_cache_aio_open(ngx_http_request_t *r, ngx_http_cache_t *c)
+{
+    ngx_int_t                  rc;
+    ngx_http_file_cache_t     *cache;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    if (c->file.fd != NGX_INVALID_FILE) {
+        return NGX_OK;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (!c->reading) {
+        ngx_memzero(&r->open_file_info, sizeof(ngx_open_file_info_t));
+
+        r->open_file_info.uniq = c->uniq;
+        r->open_file_info.valid = clcf->open_file_cache_valid;
+        r->open_file_info.min_uses = clcf->open_file_cache_min_uses;
+        r->open_file_info.events = clcf->open_file_cache_events;
+        r->open_file_info.directio = NGX_OPEN_FILE_DIRECTIO_OFF;
+        r->open_file_info.read_ahead = clcf->read_ahead;
+
+#if (NGX_THREADS)
+        if (clcf->aio == NGX_HTTP_AIO_THREADS && clcf->aio_open) {
+            r->open_file_info.thread_task = c->thread_task;
+            r->open_file_info.thread_handler = ngx_http_cache_thread_handler;
+            r->open_file_info.thread_ctx = r;
+        }
+#endif
+    }
+
+    rc = ngx_open_cached_file(clcf->open_file_cache, &c->file.name,
+                              &r->open_file_info, r->pool);
+
+#if (NGX_THREADS)
+
+    if (rc == NGX_AGAIN) {
+        c->reading = 1;
+        return NGX_AGAIN;
+    }
+
+    c->reading = 0;
+
+#endif
+
+    if (rc != NGX_OK) {
+        switch (r->open_file_info.err) {
+
+        case NGX_OK:
+            return NGX_ERROR;
+
+        case NGX_ENOENT:
+        case NGX_ENOTDIR:
+            return ngx_http_file_cache_lock(r, c);
+
+        default:
+            ngx_log_error(NGX_LOG_CRIT, r->connection->log,
+                          r->open_file_info.err,
+                          ngx_open_file_n " \"%s\" failed", c->file.name.data);
+            return NGX_ERROR;
+        }
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http file cache fd: %d", r->open_file_info.fd);
+
+    cache = c->file_cache;
+    c->file.fd = r->open_file_info.fd;
+    c->file.log = r->connection->log;
+    c->uniq = r->open_file_info.uniq;
+    c->length = r->open_file_info.size;
+    c->fs_size = (r->open_file_info.fs_size + cache->bsize - 1) / cache->bsize;
+
+    c->buf = ngx_create_temp_buf(r->pool, c->body_start);
+    if (c->buf == NULL) {
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -1231,6 +1270,7 @@ ngx_http_file_cache_reopen(ngx_http_request_t *r, ngx_http_cache_t *c)
     ngx_shmtx_unlock(&cache->shpool->mutex);
 
     c->secondary = 1;
+    c->file.fd = NGX_INVALID_FILE;
     c->file.name.len = 0;
     c->body_start = c->buffer_size;
 

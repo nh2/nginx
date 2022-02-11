@@ -423,6 +423,13 @@ static ngx_command_t  ngx_http_core_commands[] = {
       offsetof(ngx_http_core_loc_conf_t, aio_write),
       NULL },
 
+    { ngx_string("aio_open"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_core_loc_conf_t, aio_open),
+      NULL },
+
     { ngx_string("read_ahead"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_size_slot,
@@ -2661,6 +2668,21 @@ ngx_http_cleanup_add(ngx_http_request_t *r, size_t size)
 
 
 ngx_int_t
+ngx_http_set_open_file(ngx_http_request_t *r,
+    ngx_http_core_loc_conf_t *clcf, ngx_str_t *path, ngx_open_file_info_t *of)
+{
+    of->read_ahead = clcf->read_ahead;
+    of->directio = clcf->directio;
+    of->valid = clcf->open_file_cache_valid;
+    of->min_uses = clcf->open_file_cache_min_uses;
+    of->errors = clcf->open_file_cache_errors;
+    of->events = clcf->open_file_cache_events;
+
+    return ngx_http_set_disable_symlinks(r, clcf, path, of);
+}
+
+
+ngx_int_t
 ngx_http_set_disable_symlinks(ngx_http_request_t *r,
     ngx_http_core_loc_conf_t *clcf, ngx_str_t *path, ngx_open_file_info_t *of)
 {
@@ -3588,6 +3610,7 @@ ngx_http_core_create_loc_conf(ngx_conf_t *cf)
     clcf->subrequest_output_buffer_size = NGX_CONF_UNSET_SIZE;
     clcf->aio = NGX_CONF_UNSET;
     clcf->aio_write = NGX_CONF_UNSET;
+    clcf->aio_open = NGX_CONF_UNSET;
 #if (NGX_THREADS)
     clcf->thread_pool = NGX_CONF_UNSET_PTR;
     clcf->thread_pool_value = NGX_CONF_UNSET_PTR;
@@ -3815,6 +3838,7 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               (size_t) ngx_pagesize);
     ngx_conf_merge_value(conf->aio, prev->aio, NGX_HTTP_AIO_OFF);
     ngx_conf_merge_value(conf->aio_write, prev->aio_write, 0);
+    ngx_conf_merge_value(conf->aio_open, prev->aio_open, 0);
 #if (NGX_THREADS)
     ngx_conf_merge_ptr_value(conf->thread_pool, prev->thread_pool, NULL);
     ngx_conf_merge_ptr_value(conf->thread_pool_value, prev->thread_pool_value,

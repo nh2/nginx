@@ -386,6 +386,8 @@ extern ngx_uint_t  ngx_file_aio;
 #endif
 
 #if (NGX_THREADS)
+ngx_int_t ngx_thread_open(ngx_file_t *file, u_char *name,
+    ngx_int_t mode, ngx_int_t create, ngx_int_t access, ngx_pool_t *pool);
 ssize_t ngx_thread_read(ngx_file_t *file, u_char *buf, size_t size,
     off_t offset, ngx_pool_t *pool);
 ssize_t ngx_thread_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl,
